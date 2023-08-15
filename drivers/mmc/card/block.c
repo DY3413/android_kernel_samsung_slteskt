@@ -51,19 +51,6 @@
 #include "queue.h"
 
 MODULE_ALIAS("mmc:block");
-
-#if defined(CONFIG_MMC_CPRM)
-#include "cprmdrv_samsung.h"
-#include <linux/ioctl.h>
-#define MMC_IOCTL_BASE		0xB3 /* Same as MMC block device major number */
-#define MMC_IOCTL_GET_SECTOR_COUNT	_IOR(MMC_IOCTL_BASE, 100, int)
-#define MMC_IOCTL_GET_SECTOR_SIZE		_IOR(MMC_IOCTL_BASE, 101, int)
-#define MMC_IOCTL_GET_BLOCK_SIZE		_IOR(MMC_IOCTL_BASE, 102, int)
-#define MMC_IOCTL_SET_RETRY_AKE_PROCESS		_IOR(MMC_IOCTL_BASE, 104, int)
-
-static int cprm_ake_retry_flag;
-#endif
-
 #ifdef MODULE_PARAM_PREFIX
 #undef MODULE_PARAM_PREFIX
 #endif
@@ -75,7 +62,7 @@ static int cprm_ake_retry_flag;
 #define INAND_CMD38_ARG_SECERASE 0x80
 #define INAND_CMD38_ARG_SECTRIM1 0x81
 #define INAND_CMD38_ARG_SECTRIM2 0x88
-#define MMC_BLK_TIMEOUT_MS  (20 * 1000)        /* 20 sec timeout */
+#define MMC_BLK_TIMEOUT_MS  (10 * 60 * 1000)        /* 10 minute timeout */
 
 #define mmc_req_rel_wr(req)	((req->cmd_flags & REQ_FUA) && \
 				  (rq_data_dir(req) == WRITE))
@@ -630,84 +617,6 @@ static int mmc_blk_ioctl(struct block_device *bdev, fmode_t mode,
 	struct mmc_blk_data *md = bdev->bd_disk->private_data;
 	struct mmc_card *card = md->queue.card;
 	int ret = -EINVAL;
-
-#if defined(CONFIG_MMC_CPRM)
-	printk(KERN_DEBUG " %s ], %x ", __func__, cmd);
-
-	switch (cmd) {
-	case MMC_IOCTL_SET_RETRY_AKE_PROCESS:
-		cprm_ake_retry_flag = 1;
-		ret = 0;
-		break;
-
-	case MMC_IOCTL_GET_SECTOR_COUNT: {
-		int size = 0;
-
-		size = (int)get_capacity(md->disk) << 9;
-		printk(KERN_DEBUG "[%s]:MMC_IOCTL_GET_SECTOR_COUNT size = %d\n",
-				__func__, size);
-
-		return copy_to_user((void *)arg, &size, sizeof(u64));
-		}
-		break;
-	case ACMD13:
-	case ACMD18:
-	case ACMD25:
-	case ACMD43:
-	case ACMD44:
-	case ACMD45:
-	case ACMD46:
-	case ACMD47:
-	case ACMD48: {
-		struct cprm_request *req = (struct cprm_request *)arg;
-		static int i;
-		static unsigned long temp_arg[16] = {0};
-
-		printk(KERN_DEBUG "%s:cmd [%x]\n",
-				__func__, cmd);
-
-		if (cmd == ACMD43) {
-			printk(KERN_DEBUG"storing acmd43 arg[%d] = %ul\n",
-					i, (unsigned int)req->arg);
-			temp_arg[i] = req->arg;
-			i++;
-			if (i >= 16) {
-				printk(KERN_DEBUG"reset acmd43 i = %d\n", i);
-				i = 0;
-			}
-		}
-		if (cmd == ACMD45 && cprm_ake_retry_flag == 1) {
-			cprm_ake_retry_flag = 0;
-			printk(KERN_DEBUG"ACMD45.. I'll call ACMD43 and ACMD44 first\n");
-
-			for (i = 0; i < 16; i++) {
-				printk(KERN_DEBUG"calling ACMD43 with arg[%d] = %ul\n",
-						i, (unsigned int)temp_arg[i]);
-				if (stub_sendcmd(card, ACMD43, temp_arg[i],
-							512, NULL) < 0) {
-					printk(KERN_DEBUG"error ACMD43 %d\n",
-							i);
-					return -EINVAL;
-				}
-			}
-			printk(KERN_DEBUG"calling ACMD44\n");
-			if (stub_sendcmd(card, ACMD44, 0, 8, NULL) < 0) {
-
-				printk(KERN_DEBUG"error in ACMD44 %d\n",
-						i);
-				return -EINVAL;
-			}
-
-		}
-		return stub_sendcmd(card, req->cmd,
-				req->arg, req->len, req->buff);
-		}
-		break;
-	default:
-		printk(KERN_DEBUG"%s: Invalid ioctl command\n", __func__);
-		break;
-	}
-#endif
 
 	if (cmd == MMC_IOC_CMD)
 		ret = mmc_blk_ioctl_cmd(bdev, (struct mmc_ioc_cmd __user *)arg);
@@ -1372,19 +1281,6 @@ static int mmc_blk_err_check(struct mmc_card *card,
 				pr_err("%s: error %d requesting status\n",
 				       req->rq_disk->disk_name, err);
 				return MMC_BLK_CMD_ERR;
-			}
-
-			if (status & CMD_ERRORS) {
-				pr_err("%s: command error reported, status = %#x\n",
-					req->rq_disk->disk_name, status);
-				if (!(status & R1_WP_VIOLATION))
-					brq->data.error = -EIO;
-				if ((R1_CURRENT_STATE(status) == R1_STATE_RCV) ||
-					(R1_CURRENT_STATE(status) == R1_STATE_DATA)) {
-					err = send_stop(card, &status);
-					if (err)
-						return MMC_BLK_ABORT;
-				}
 			}
 
 			/* Timeout if the device never becomes ready for data
@@ -2354,21 +2250,17 @@ static int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
 	unsigned int cmd_flags = req ? req->cmd_flags : 0;
 	unsigned long flags;
 
-	if (card->ext_csd.cmdq_mode_en) {
-		mmc_claim_host(card->host);
 #ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
-		if (mmc_bus_needs_resume(card->host))
-			mmc_resume_bus(card->host);
+	if (mmc_bus_needs_resume(card->host))
+		mmc_resume_bus(card->host);
 #endif
-	} else {
-		if (req && !mq->mqrq_prev->req) {
+
+	if (card->ext_csd.cmdq_mode_en)
+		mmc_claim_host(card->host);
+	else {
+		if (req && !mq->mqrq_prev->req)
 			/* claim host only for the first request */
 			mmc_claim_host(card->host);
-#ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
-			if (mmc_bus_needs_resume(card->host))
-				mmc_resume_bus(card->host);
-#endif
-		}
 	}
 
 	ret = mmc_blk_part_switch(card, md);
@@ -2926,7 +2818,7 @@ static int mmc_blk_probe(struct mmc_card *card)
 	mmc_fixup_device(card, blk_fixups);
 
 #ifdef CONFIG_MMC_BLOCK_DEFERRED_RESUME
-	if (card && mmc_card_sd(card))
+	if (card && mmc_card_mmc(card))
 		mmc_set_bus_resume_policy(card->host, 1);
 #endif
 	if (mmc_add_disk(md))
@@ -2966,45 +2858,19 @@ static void mmc_blk_remove(struct mmc_card *card)
 #endif
 }
 
-static int mmc_blk_shutdown(struct mmc_card *card)
-{
-	struct mmc_blk_data *part_md;
-	struct mmc_blk_data *md = mmc_get_drvdata(card);
-
-	if (md) {
-		mmc_queue_suspend(&md->queue, 1);
-		list_for_each_entry(part_md, &md->part, part) {
-			mmc_queue_suspend(&part_md->queue, 1);
-		}
-	}
-	return 0;
-}
-
 #ifdef CONFIG_PM
 static int mmc_blk_suspend(struct mmc_card *card)
 {
 	struct mmc_blk_data *part_md;
 	struct mmc_blk_data *md = mmc_get_drvdata(card);
-	int rc = 0;
 
 	if (md) {
-		rc = mmc_queue_suspend(&md->queue, 0);
-		if (rc)
-			goto out;
+		mmc_queue_suspend(&md->queue);
 		list_for_each_entry(part_md, &md->part, part) {
-			rc = mmc_queue_suspend(&part_md->queue, 0);
-			if (rc)
-				goto out_resume;
+			mmc_queue_suspend(&part_md->queue);
 		}
 	}
-	goto out;
-out_resume:
-	mmc_queue_resume(&md->queue);
-	list_for_each_entry(part_md, &md->part, part) {
-		mmc_queue_resume(&part_md->queue);
-	}
-out:
-	return rc;
+	return 0;
 }
 
 static int mmc_blk_resume(struct mmc_card *card)
@@ -3038,7 +2904,6 @@ static struct mmc_driver mmc_driver = {
 	.remove		= mmc_blk_remove,
 	.suspend	= mmc_blk_suspend,
 	.resume		= mmc_blk_resume,
-	.shutdown	= mmc_blk_shutdown,
 };
 
 static int __init mmc_blk_init(void)
