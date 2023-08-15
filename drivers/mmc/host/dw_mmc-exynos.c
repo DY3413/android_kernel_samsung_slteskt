@@ -30,6 +30,7 @@
 #include <mach/exynos-dwmci.h>
 #include <mach/exynos-pm.h>
 #include <mach/pinctrl-samsung.h>
+#include <mach/smc.h>
 
 #include "dw_mmc.h"
 #include "dw_mmc-pltfm.h"
@@ -42,6 +43,9 @@ unsigned int dw_mci_save_sfr[3][30];
 
 extern void dw_mci_ciu_reset(struct device *dev, struct dw_mci *host);
 extern bool dw_mci_fifo_reset(struct device *dev, struct dw_mci *host);
+extern void dw_mci_idma_reset_dma(struct dw_mci *host);
+
+extern uint32_t mmc0_reg, mmc2_reg;
 
 static int dw_mci_exynos_priv_init(struct dw_mci *host)
 {
@@ -144,7 +148,7 @@ void dw_mci_reg_dump(struct dw_mci *host)
 			atomic_read(&host->ciu_en_win));
 	dev_err(host->dev, ": ===========================================\n");
 	if ((mci_readl(host, IDSTS) == 0x4000) && (mci_readl(host, MPSTAT) & 0x1))
-		panic("eMMC DMA BUS hang.\n");
+		panic("AP system BUS is hung up.\n");
 }
 
 /*
@@ -178,7 +182,6 @@ static void exynos_sfr_save(unsigned int i)
 #if defined(CONFIG_SOC_EXYNOS5433)
 	dw_mci_save_sfr[i][15] = mci_readl(host, DBADDRL);
 	dw_mci_save_sfr[i][16] = mci_readl(host, DBADDRU);
-	dw_mci_save_sfr[i][20] = mci_readl(host, MPSECURITY);
 #else
 	dw_mci_save_sfr[i][15] = mci_readl(host, DBADDR);
 #endif
@@ -218,6 +221,73 @@ static void dw_mci_exynos_smu_reset(struct dw_mci *host)
 	}
 }
 #endif
+#if defined (CONFIG_SOC_EXYNOS5433) || defined (CONFIG_SOC_EXYNOS5430)
+static void exynos_sfr_restore(unsigned int i)
+{
+	struct dw_mci *host = dw_mci_lpa_host[i];
+	const struct dw_mci_drv_data *drv_data;
+
+	drv_data = host->drv_data;
+
+	mci_writel(host, CTRL , dw_mci_save_sfr[i][0]);
+	mci_writel(host, PWREN, dw_mci_save_sfr[i][1]);
+	mci_writel(host, CLKDIV, dw_mci_save_sfr[i][2]);
+	mci_writel(host, CLKSRC, dw_mci_save_sfr[i][3]);
+	mci_writel(host, CLKENA, dw_mci_save_sfr[i][4]);
+	mci_writel(host, TMOUT, dw_mci_save_sfr[i][5]);
+	mci_writel(host, CTYPE, dw_mci_save_sfr[i][6]);
+	mci_writel(host, INTMASK, dw_mci_save_sfr[i][7]);
+	mci_writel(host, FIFOTH, dw_mci_save_sfr[i][8]);
+	mci_writel(host, UHS_REG, dw_mci_save_sfr[i][9]);
+	mci_writel(host, BMOD  , dw_mci_save_sfr[i][10]);
+	mci_writel(host, PLDMND, dw_mci_save_sfr[i][11]);
+	mci_writel(host, IDINTEN, dw_mci_save_sfr[i][12]);
+	mci_writel(host, CLKSEL, dw_mci_save_sfr[i][13]);
+	mci_writel(host, CDTHRCTL, dw_mci_save_sfr[i][14]);
+#if defined(CONFIG_SOC_EXYNOS5433)
+	mci_writel(host, DBADDRL, dw_mci_save_sfr[i][15]);
+	mci_writel(host, DBADDRU, dw_mci_save_sfr[i][16]);
+	if (drv_data && drv_data->cfg_smu) {
+		dw_mci_exynos_smu_reset(host);
+		drv_data->cfg_smu(host);
+	}
+#else
+	mci_writel(host, DBADDR, dw_mci_save_sfr[i][15]);
+#endif
+	mci_writel(host, DDR200_RDDQS_EN, dw_mci_save_sfr[i][17]);
+	mci_writel(host, DDR200_DLINE_CTRL, dw_mci_save_sfr[i][18]);
+#if defined(CONFIG_SOC_EXYNOS5422) || defined(CONFIG_SOC_EXYNOS5430) || defined(CONFIG_SOC_EXYNOS5433)
+	mci_writel(host, DDR200_ENABLE_SHIFT, dw_mci_save_sfr[i][19]);
+#endif
+	atomic_inc_return(&host->ciu_en_win);
+	dw_mci_ciu_clk_en(host, false);
+
+
+#ifdef CONFIG_BCM4334
+	if (i == 1)
+		return;
+#endif
+
+	dw_mci_fifo_reset(host->dev, host);
+	dw_mci_ciu_reset(host->dev, host);
+#ifdef CONFIG_MMC_DW_IDMAC
+	dw_mci_idma_reset_dma(host);
+#endif
+
+	/* For eMMC HS400 mode */
+	if (i == 0)
+		mci_writel(host, DDR200_ASYNC_FIFO_CTRL, 0x1);
+
+	atomic_dec_return(&host->ciu_en_win);
+
+	/* For unuse clock gating */
+	if (host->pdata->enable_cclk_on_suspend) {
+		host->pdata->on_suspend = false;
+		dw_mci_ciu_clk_dis(host);
+	}
+
+}
+#else
 
 static void exynos_sfr_restore(unsigned int i)
 {
@@ -249,7 +319,6 @@ static void exynos_sfr_restore(unsigned int i)
 	mci_writel(host, DBADDRL, dw_mci_save_sfr[i][15]);
 	mci_writel(host, DBADDRU, dw_mci_save_sfr[i][16]);
 	if (drv_data && drv_data->cfg_smu) {
-		mci_writel(host, MPSECURITY, dw_mci_save_sfr[i][20]);
 		dw_mci_exynos_smu_reset(host);
 		drv_data->cfg_smu(host);
 	}
@@ -299,6 +368,7 @@ static void exynos_sfr_restore(unsigned int i)
 	if (startbit_clear == false)
 		dev_err(host->dev, "CMD start bit stuck %02d\n", i);
 }
+#endif
 
 static int dw_mmc_exynos_notifier0(struct notifier_block *self,
 					unsigned long cmd, void *v)
@@ -391,7 +461,7 @@ void dw_mci_exynos_unregister_notifier(struct dw_mci *host)
  */
 void dw_mci_exynos_cfg_smu(struct dw_mci *host)
 {
-	volatile unsigned int reg;
+	int ret;
 
 #ifdef CONFIG_MMC_DW_FMP_DM_CRYPT
 	if (!((host->pdata->quirks & DW_MCI_QUIRK_USE_SMU) ||
@@ -402,10 +472,16 @@ void dw_mci_exynos_cfg_smu(struct dw_mci *host)
 		return;
 #endif
 
-	reg = __raw_readl(host->regs + SDMMC_MPSECURITY);
-
-	/* Extended Descriptor On */
-	mci_writel(host, MPSECURITY, reg | (1 << 31));
+	if ((uint32_t)host->regs == mmc0_reg)
+		ret = exynos_smc(SMC_CMD_REG, SMC_REG_ID_SFR_W(EMMC0_FMP), 0, 0);
+	else if ((uint32_t)host->regs == mmc2_reg)
+		ret = exynos_smc(SMC_CMD_REG, SMC_REG_ID_SFR_W(EMMC2_FMP), 0, 0);
+	else {
+		dev_err(host->dev, "Not supported MMC host for FMP\n");
+		return;
+	}
+	if (ret)
+		dev_err(host->dev, "Fail to smc call for FMP SECURITY\n");
 
 #ifndef CONFIG_MMC_DW_FMP_DM_CRYPT
 	mci_writel(host, MPSBEGIN0, 0);
@@ -477,8 +553,6 @@ static void dw_mci_exynos_register_dump(struct dw_mci *host)
 	if (is_smu) {
 		dev_err(host->dev, ": EMMCP_BASE:	0x%08x\n",
 			mci_readl(host, EMMCP_BASE));
-		dev_err(host->dev, ": MPSECURITY:	0x%08x\n",
-			mci_readl(host, MPSECURITY));
 		dev_err(host->dev, ": MPSTAT:	0x%08x\n",
 			mci_readl(host, MPSTAT));
 		for (i = 0; i < 8; i++) {
@@ -728,6 +802,12 @@ static int dw_mci_exynos_parse_dt(struct dw_mci *host)
 	else
 		priv->cd_gpio = -1;
 
+	if (of_get_property(np, "sec-sd-slot-type", NULL))
+		of_property_read_u32(np,
+			"sec-sd-slot-type", &priv->sec_sd_slot_type);
+	else
+		priv->sec_sd_slot_type = -1;
+
 	if (of_property_read_u32(np, "selclk_drv", &priv->selclk_drv))
 		priv->selclk_drv = 3;
 
@@ -780,6 +860,8 @@ static int dw_mci_exynos_parse_dt(struct dw_mci *host)
 		priv->ctrl_flag |= DW_MMC_EXYNOS_BYPASS_FOR_ALL_PASS;
 	if (of_find_property(np, "use-enable-shift", NULL))
 		priv->ctrl_flag |= DW_MMC_EXYNOS_ENABLE_SHIFT;
+	if (of_find_property(np, "ignore-lv1", NULL))
+		priv->ctrl_flag |= DW_MMC_EXYNOS_IGNORE_LV1;
 
 	id = of_alias_get_id(host->dev->of_node, "mshc");
 	switch (id) {
@@ -1301,11 +1383,16 @@ static int dw_mci_exynos_execute_tuning(struct dw_mci *host, u32 opcode)
 			/*
 			 * Get at middle clock sample values.
 			 */
-			if (priv->ctrl_flag & DW_MMC_EXYNOS_BYPASS_FOR_ALL_PASS)
-				bypass = (all_pass_count >= (priv->drv_str_num - 1)) ? true : false;
-
+			if ((priv->ctrl_flag & DW_MMC_EXYNOS_IGNORE_LV1)
+					&& (priv->drv_str_val == DRV_STR_LV1))
+				sample_good = abnormal_result;
+				
 			if (sample_good == abnormal_result)
 				all_pass_count++;
+
+			if (priv->ctrl_flag & DW_MMC_EXYNOS_BYPASS_FOR_ALL_PASS)
+				bypass = (all_pass_count >= (priv->drv_str_num)) ? true : false;
+
 			if (bypass) {
 				dev_info(host->dev, "Bypassed for all pass at %d times\n", priv->drv_str_num);
 				if (en_fine_tuning) {
@@ -1428,23 +1515,30 @@ static ssize_t sd_detection_cmd_show(struct device *dev,
 {
 	struct dw_mci *host = dev_get_drvdata(dev);
 	struct dw_mci_exynos_priv_data *priv = host->priv;
-	unsigned int detect;
 
-	if (gpio_is_valid(priv->cd_gpio))
-		detect = gpio_get_value(priv->cd_gpio);
-	else {
-		dev_info(host->dev, "%s : External SD detect pin Error\n", __func__);
-		return  sprintf(buf, "Error\n");
-	}
+	if (host->cur_slot && host->cur_slot->mmc && host->cur_slot->mmc->card) {
+		if (priv->sec_sd_slot_type > 0 && !gpio_is_valid(priv->cd_gpio))
+			goto gpio_error;
 
-	dev_dbg(host->dev, "%s : detect = %d.\n", __func__,  !detect);
-	if (!detect) {
-		dev_info(host->dev, "card inserted.\n");
+		dev_info(host->dev, "SD card inserted.\n");
 		return sprintf(buf, "Insert\n");
 	} else {
-		dev_info(host->dev, "card removed.\n");
+		if (priv->sec_sd_slot_type > 0 && !gpio_is_valid(priv->cd_gpio))
+			goto gpio_error;
+
+		if (gpio_get_value(priv->cd_gpio)
+				&& priv->sec_sd_slot_type == SEC_HYBRID_SD_SLOT) {
+			dev_info(host->dev, "SD slot tray Removed.\n");
+			return sprintf(buf, "Notray\n");
+		}
+
+		dev_info(host->dev, "SD card removed.\n");
 		return sprintf(buf, "Remove\n");
 	}
+
+gpio_error:
+	dev_info(host->dev, "%s : External SD detect pin Error\n", __func__);
+	return  sprintf(buf, "Error\n");
 }
 
 static DEVICE_ATTR(status, 0444, sd_detection_cmd_show, NULL);
@@ -1549,6 +1643,7 @@ static int dw_mci_exynos_request_ext_irq(struct dw_mci *host,
 					"tflash_det", host) == 0) {
 			dev_warn(host->dev, "success to request irq for card detect.\n");
 			enable_irq_wake(ext_cd_irq);
+			host->cd_irq = ext_cd_irq;
 
 			if (!sd_detection_cmd_dev) {
 				sd_detection_cmd_dev = sec_device_create(host, "sdcard");
